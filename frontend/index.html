@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Folder Transfer</title>
+<style>
+body { font-family: Arial; padding: 30px; background: #f5f5f5; }
+.container { max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 10px; box-shadow: 0 0 15px rgba(0,0,0,0.1); }
+h2 { text-align: center; }
+input[type="file"] { width: 100%; margin-top: 10px; }
+button { margin-top: 20px; width: 100%; padding: 10px; border-radius: 5px; border: none; background: #4CAF50; color: white; cursor: pointer; font-size: 16px; }
+button:hover { background: #45a049; }
+button:disabled { background: #cccccc; cursor: not-allowed; }
+.button-group { display: flex; gap: 10px; margin-top: 20px; }
+.button-group button { margin-top: 0; flex: 1; }
+.btn-pause { background: #ff9800; }
+.btn-pause:hover { background: #f57c00; }
+.btn-resume { background: #2196F3; }
+.btn-resume:hover { background: #1976D2; }
+.info { margin-top: 15px; font-size: 14px; }
+.file-list { margin-top: 20px; max-height: 400px; overflow-y: auto; display: none; }
+.file-item { margin-bottom: 15px; padding: 10px; background: #f9f9f9; border-radius: 5px; position: relative; }
+.file-item.completed { background: #e8f5e9; }
+.file-item.failed { background: #ffebee; }
+.file-item.paused { background: #fff3e0; }
+.file-item.removed { opacity: 0.5; background: #f5f5f5; }
+.file-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; gap: 10px; }
+.file-name { font-size: 14px; word-break: break-all; color: #333; flex: 1; min-width: 0; }
+.btn-remove { background: #f44336; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; font-size: 12px; flex-shrink: 0; width: 20%; max-width: 100px; white-space: nowrap; }
+.btn-remove:hover { background: #d32f2f; }
+.btn-remove:disabled { background: #cccccc; cursor: not-allowed; }
+.progress-bar-container { width: 100%; height: 20px; background-color: #e0e0e0; border-radius: 10px; overflow: hidden; }
+.progress-bar { height: 100%; background-color: #4CAF50; width: 0%; transition: width 0.3s ease; border-radius: 10px; }
+.progress-text { font-size: 12px; margin-top: 5px; color: #666; }
+</style>
+</head>
+<body>
+<div class="container">
+    <h2>Folder Transfer</h2>
+
+    <label>Select folder to transfer:</label>
+    <input type="file" id="folderInput" webkitdirectory directory multiple>
+
+    <div class="info" id="metaInfo">No folder selected</div>
+
+    <div class="button-group">
+        <button id="confirmBtn" disabled>Start Transfer</button>
+        <button id="pauseBtn" disabled style="display: none;">Pause</button>
+        <button id="resumeBtn" disabled style="display: none;">Resume</button>
+    </div>
+
+    <div class="file-list" id="fileList">
+        <h3 style="margin-top: 0;">Uploading Files:</h3>
+        <div id="fileListContent"></div>
+    </div>
+</div>
+
+<script>
+const folderInput = document.getElementById("folderInput");
+const confirmBtn = document.getElementById("confirmBtn");
+const pauseBtn = document.getElementById("pauseBtn");
+const resumeBtn = document.getElementById("resumeBtn");
+const metaInfo = document.getElementById("metaInfo");
+const fileList = document.getElementById("fileList");
+const fileListContent = document.getElementById("fileListContent");
+
+let selectedFiles = [];
+let folderName = "";
+let fileProgress = {};
+let removedFileIndices = new Set(); // Track removed files by their original index
+let uploadState = {
+    isUploading: false,
+    isPaused: false,
+    currentFileIndex: 0,
+    uploadedFiles: new Set(),
+    xhr: null,
+    storagePath: null,
+    currentUploadIndex: null // Track which file index is currently uploading
+};
+
+folderInput.addEventListener("change", () => {
+    const newFiles = Array.from(folderInput.files);
+    if (!newFiles.length) {
+        if (selectedFiles.length === 0) {
+            metaInfo.innerText = "No folder selected";
+            confirmBtn.disabled = true;
+            fileList.style.display = "none";
+        }
+        return;
+    }
+
+    // If this is the first selection, set folder name and clear removed indices
+    if (selectedFiles.length === 0) {
+        folderName = newFiles[0].webkitRelativePath.split("/")[0];
+        removedFileIndices.clear();
+        selectedFiles = newFiles;
+    } else {
+        // Add new files to existing list
+        // Check if files are from the same folder
+        const newFolderName = newFiles[0].webkitRelativePath.split("/")[0];
+        if (newFolderName !== folderName) {
+            // Allow adding files from different folders, but show a message
+            console.log(`Adding files from different folder: ${newFolderName} (current: ${folderName})`);
+        }
+        
+        // Add new files, avoiding duplicates based on webkitRelativePath
+        const existingPaths = new Set(selectedFiles.map(f => f.webkitRelativePath || f.name));
+        newFiles.forEach(file => {
+            const filePath = file.webkitRelativePath || file.name;
+            if (!existingPaths.has(filePath)) {
+                selectedFiles.push(file);
+                existingPaths.add(filePath);
+            }
+        });
+    }
+
+    // Update UI
+    const remainingFiles = selectedFiles.length - removedFileIndices.size;
+    const totalSizeMB = selectedFiles
+        .filter((_, idx) => !removedFileIndices.has(idx))
+        .reduce((acc, f) => acc + f.size, 0) / (1024*1024);
+
+    metaInfo.innerText = `Folder: ${folderName}\nFiles: ${remainingFiles}\nTotal size: ${totalSizeMB.toFixed(2)} MB`;
+    
+    // If upload is in progress, update the file list to show new files
+    if (uploadState.isUploading || fileList.style.display === "block") {
+        createFileList();
+    } else {
+        confirmBtn.disabled = false;
+    }
+    
+    // Reset file input to allow selecting the same folder again
+    folderInput.value = "";
+});
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function createFileList() {
+    fileListContent.innerHTML = "";
+    fileProgress = {};
+    
+    selectedFiles.forEach((file, index) => {
+        // Skip removed files
+        if (removedFileIndices.has(index)) {
+            return;
+        }
+        
+        const fileItem = document.createElement("div");
+        fileItem.className = "file-item";
+        fileItem.id = `file-${index}`;
+        
+        const fileHeader = document.createElement("div");
+        fileHeader.className = "file-header";
+        
+        const fileName = document.createElement("div");
+        fileName.className = "file-name";
+        fileName.textContent = file.webkitRelativePath || file.name;
+        
+        const removeBtn = document.createElement("button");
+        removeBtn.className = "btn-remove";
+        removeBtn.textContent = "Remove";
+        removeBtn.onclick = () => removeFile(index);
+        
+        fileHeader.appendChild(fileName);
+        fileHeader.appendChild(removeBtn);
+        
+        const progressContainer = document.createElement("div");
+        progressContainer.className = "progress-bar-container";
+        
+        const progressBar = document.createElement("div");
+        progressBar.className = "progress-bar";
+        progressBar.id = `progress-${index}`;
+        
+        const progressText = document.createElement("div");
+        progressText.className = "progress-text";
+        progressText.id = `progress-text-${index}`;
+        
+        const relPath = file.webkitRelativePath || file.name;
+        const isUploaded = uploadState.uploadedFiles.has(relPath);
+        
+        if (isUploaded) {
+            progressBar.style.width = "100%";
+            progressText.textContent = "100% - Already uploaded";
+            fileItem.classList.add("completed");
+        } else {
+            progressText.textContent = "0% - Waiting...";
+        }
+        
+        progressContainer.appendChild(progressBar);
+        fileItem.appendChild(fileHeader);
+        fileItem.appendChild(progressContainer);
+        fileItem.appendChild(progressText);
+        fileListContent.appendChild(fileItem);
+        
+        fileProgress[index] = {
+            loaded: isUploaded ? file.size : 0,
+            total: file.size,
+            name: relPath,
+            status: isUploaded ? "completed" : "waiting"
+        };
+    });
+    
+    fileList.style.display = "block";
+}
+
+function removeFile(fileIndex) {
+    // If this file is currently being uploaded, abort it
+    if (uploadState.isUploading && uploadState.currentUploadIndex === fileIndex) {
+        if (uploadState.xhr) {
+            uploadState.xhr.abort();
+            uploadState.xhr = null;
+        }
+        uploadState.currentUploadIndex = null;
+        
+        // Move to next file
+        uploadState.currentFileIndex = fileIndex + 1;
+        // Find next non-removed file
+        let nextIndex = uploadState.currentFileIndex;
+        for (let i = uploadState.currentFileIndex; i < selectedFiles.length; i++) {
+            if (!removedFileIndices.has(i)) {
+                const relPath = selectedFiles[i].webkitRelativePath || selectedFiles[i].name;
+                if (!uploadState.uploadedFiles.has(relPath)) {
+                    nextIndex = i;
+                    break;
+                }
+            }
+        }
+        if (nextIndex >= selectedFiles.length) {
+            // All files done
+            uploadFile(selectedFiles.length);
+        } else {
+            uploadState.currentFileIndex = nextIndex;
+            if (!uploadState.isPaused) {
+                uploadFile(nextIndex);
+            }
+        }
+    }
+    
+    // Mark file as removed
+    removedFileIndices.add(fileIndex);
+    
+    // Update UI - hide or mark as removed
+    const fileItem = document.getElementById(`file-${fileIndex}`);
+    if (fileItem) {
+        fileItem.classList.add("removed");
+        fileItem.style.display = "none"; // Hide it
+    }
+    
+    // Update file count in meta info
+    const remainingFiles = selectedFiles.length - removedFileIndices.size;
+    if (remainingFiles === 0) {
+        metaInfo.innerText = "No files remaining";
+        confirmBtn.disabled = true;
+        if (uploadState.isUploading) {
+            uploadState.isUploading = false;
+            confirmBtn.textContent = "Start Transfer";
+            pauseBtn.style.display = "none";
+            resumeBtn.style.display = "none";
+        }
+        fileList.style.display = "none";
+    } else {
+        const totalSizeMB = selectedFiles
+            .filter((_, idx) => !removedFileIndices.has(idx))
+            .reduce((acc, f) => acc + f.size, 0) / (1024*1024);
+        metaInfo.innerText = `Folder: ${folderName}\nFiles: ${remainingFiles}\nTotal size: ${totalSizeMB.toFixed(2)} MB`;
+    }
+}
+
+function updateFileStatus(fileIndex, status, message) {
+    const fileItem = document.getElementById(`file-${fileIndex}`);
+    const progressText = document.getElementById(`progress-text-${fileIndex}`);
+    
+    if (fileItem) {
+        fileItem.classList.remove("completed", "failed", "paused", "uploading");
+        if (status) {
+            fileItem.classList.add(status);
+        }
+    }
+    
+    if (progressText && message) {
+        progressText.textContent = message;
+    }
+    
+    if (fileProgress[fileIndex]) {
+        fileProgress[fileIndex].status = status;
+    }
+}
+
+function updateFileProgress(fileIndex, loaded, total) {
+    const percentage = total > 0 ? Math.min(100, (loaded / total) * 100) : 0;
+    const progressBar = document.getElementById(`progress-${fileIndex}`);
+    const progressText = document.getElementById(`progress-text-${fileIndex}`);
+    
+    if (progressBar) {
+        progressBar.style.width = percentage + "%";
+    }
+    
+    if (progressText) {
+        if (percentage >= 100) {
+            progressText.textContent = "100% - Completed";
+            updateFileStatus(fileIndex, "completed");
+            fileProgress[fileIndex].loaded = total;
+        } else {
+            progressText.textContent = `${percentage.toFixed(1)}% - ${formatFileSize(loaded)} / ${formatFileSize(total)}`;
+            updateFileStatus(fileIndex, "uploading");
+        }
+    }
+    
+    if (fileProgress[fileIndex]) {
+        fileProgress[fileIndex].loaded = loaded;
+    }
+}
+
+async function checkUploadedFiles() {
+    if (!folderName) return;
+    
+    try {
+        const BASE_URL = window.location.origin;
+        const response = await fetch(`${BASE_URL}/list_uploaded?folder_name=${encodeURIComponent(folderName)}`);
+        const data = await response.json();
+        
+        if (data.uploaded_files) {
+            data.uploaded_files.forEach(filePath => {
+                uploadState.uploadedFiles.add(filePath);
+            });
+        }
+        
+        // Store the storage path for later display
+        if (data.folder_path) {
+            uploadState.storagePath = data.folder_path;
+        } else if (data.storage_path) {
+            uploadState.storagePath = data.storage_path + "/" + folderName;
+        }
+    } catch (err) {
+        console.error("Error checking uploaded files:", err);
+    }
+}
+
+async function uploadFile(fileIndex) {
+    // Skip removed files
+    while (fileIndex < selectedFiles.length && removedFileIndices.has(fileIndex)) {
+        fileIndex++;
+    }
+    
+    if (fileIndex >= selectedFiles.length) {
+        // Check if there are any new files that were added during upload
+        let hasNewFiles = false;
+        for (let i = 0; i < selectedFiles.length; i++) {
+            if (removedFileIndices.has(i)) continue;
+            const relPath = selectedFiles[i].webkitRelativePath || selectedFiles[i].name;
+            if (!uploadState.uploadedFiles.has(relPath)) {
+                hasNewFiles = true;
+                uploadState.currentFileIndex = i;
+                uploadFile(i);
+                return;
+            }
+        }
+        
+        // All files uploaded (including newly added ones)
+        confirmBtn.textContent = "Transfer Complete";
+        confirmBtn.disabled = true;
+        pauseBtn.style.display = "none";
+        resumeBtn.style.display = "none";
+        
+        setTimeout(async () => {
+            // Get the actual storage path
+            let targetPath = uploadState.storagePath;
+            if (!targetPath) {
+                try {
+                    const BASE_URL = window.location.origin;
+                    const response = await fetch(`${BASE_URL}/get_storage_path`);
+                    const data = await response.json();
+                    const pathSep = data.storage_path.includes("\\") ? "\\" : "/";
+                    targetPath = data.storage_path + pathSep + folderName;
+                } catch (err) {
+                    targetPath = `backend\\received_files\\${folderName}`;
+                }
+            }
+            
+            // Show full absolute path
+            const fullPath = targetPath.replace(/\//g, "\\"); // Normalize to Windows path
+            alert(`Folder transferred successfully!\n\nFiles saved to:\n${fullPath}\n\nYou can find your files in:\nbackend\\received_files\\${folderName}`);
+            confirmBtn.textContent = "Start Transfer";
+            confirmBtn.disabled = false;
+            fileList.style.display = "none";
+            uploadState.isUploading = false;
+            folderInput.disabled = false;
+        }, 500);
+        return;
+    }
+    
+    if (uploadState.isPaused) {
+        return;
+    }
+    
+    const file = selectedFiles[fileIndex];
+    const relPath = file.webkitRelativePath || file.name;
+    
+    // Skip if already uploaded
+    if (uploadState.uploadedFiles.has(relPath)) {
+        updateFileProgress(fileIndex, file.size, file.size);
+        uploadFile(fileIndex + 1);
+        return;
+    }
+    
+    // Track current upload index
+    uploadState.currentUploadIndex = fileIndex;
+    
+    updateFileStatus(fileIndex, "uploading", "Uploading...");
+    
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("relativePath", relPath);
+    formData.append("folderName", folderName);
+    
+    const BASE_URL = window.location.origin;
+    const xhr = new XMLHttpRequest();
+    uploadState.xhr = xhr;
+    
+    xhr.upload.addEventListener("progress", (e) => {
+        if (e.lengthComputable && !uploadState.isPaused) {
+            updateFileProgress(fileIndex, e.loaded, e.total);
+        }
+    });
+    
+    xhr.addEventListener("load", () => {
+        if (xhr.status === 200) {
+            try {
+                const data = JSON.parse(xhr.responseText);
+                uploadState.uploadedFiles.add(relPath);
+                updateFileProgress(fileIndex, file.size, file.size);
+                
+                // Store storage path if provided
+                if (data.saved_path && !uploadState.storagePath) {
+                    const pathSep = data.saved_path.includes("\\") ? "\\" : "/";
+                    uploadState.storagePath = data.saved_path.substring(0, data.saved_path.lastIndexOf(pathSep));
+                }
+                
+                // Move to next file (skip removed ones)
+                uploadState.currentFileIndex = fileIndex + 1;
+                uploadState.currentUploadIndex = null;
+                
+                // Small delay to allow UI to update, then continue
+                setTimeout(() => {
+                    uploadFile(fileIndex + 1);
+                }, 100);
+            } catch (err) {
+                updateFileStatus(fileIndex, "failed", "Upload failed: Invalid response");
+                uploadState.isUploading = false;
+                uploadState.currentUploadIndex = null;
+                confirmBtn.disabled = false;
+                pauseBtn.style.display = "none";
+            }
+        } else {
+            try {
+                const data = JSON.parse(xhr.responseText);
+                updateFileStatus(fileIndex, "failed", `Failed: ${data.error || "Unknown error"}`);
+            } catch {
+                updateFileStatus(fileIndex, "failed", `Failed: HTTP ${xhr.status}`);
+            }
+            uploadState.isUploading = false;
+            uploadState.currentUploadIndex = null;
+            confirmBtn.disabled = false;
+            pauseBtn.style.display = "none";
+        }
+    });
+    
+    xhr.addEventListener("error", () => {
+        updateFileStatus(fileIndex, "failed", "Network error");
+        uploadState.isUploading = false;
+        uploadState.currentUploadIndex = null;
+        confirmBtn.disabled = false;
+        pauseBtn.style.display = "none";
+    });
+    
+    xhr.addEventListener("abort", () => {
+        // Upload was aborted (e.g., by remove button)
+        uploadState.currentUploadIndex = null;
+    });
+    
+    xhr.open("POST", `${BASE_URL}/upload_file`);
+    xhr.send(formData);
+}
+
+confirmBtn.addEventListener("click", async () => {
+    if (!selectedFiles.length) return;
+    
+    if (!uploadState.isUploading) {
+        // Start upload
+        await checkUploadedFiles();
+        createFileList();
+        
+        uploadState.isUploading = true;
+        uploadState.isPaused = false;
+        uploadState.currentFileIndex = 0;
+        
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Uploading...";
+        pauseBtn.style.display = "block";
+        pauseBtn.disabled = false;
+        resumeBtn.style.display = "none";
+        
+        // Keep file input enabled so users can add more files
+        folderInput.disabled = false;
+        
+        // Find first file that needs uploading (skip removed ones)
+        let startIndex = 0;
+        for (let i = 0; i < selectedFiles.length; i++) {
+            if (removedFileIndices.has(i)) continue; // Skip removed files
+            
+            const relPath = selectedFiles[i].webkitRelativePath || selectedFiles[i].name;
+            if (!uploadState.uploadedFiles.has(relPath)) {
+                startIndex = i;
+                break;
+            }
+        }
+        
+        uploadState.currentFileIndex = startIndex;
+        uploadFile(startIndex);
+    }
+});
+
+pauseBtn.addEventListener("click", () => {
+    if (uploadState.isUploading && !uploadState.isPaused) {
+        uploadState.isPaused = true;
+        if (uploadState.xhr) {
+            uploadState.xhr.abort();
+            uploadState.xhr = null;
+        }
+        
+        // Mark current file as paused (don't update currentFileIndex, so we can resume from same file)
+        if (uploadState.currentFileIndex < selectedFiles.length) {
+            const currentFile = selectedFiles[uploadState.currentFileIndex];
+            const relPath = currentFile.webkitRelativePath || currentFile.name;
+            // Only mark as paused if not already uploaded
+            if (!uploadState.uploadedFiles.has(relPath)) {
+                updateFileStatus(uploadState.currentFileIndex, "paused", "Paused - Click Resume to continue");
+            }
+        }
+        
+        pauseBtn.style.display = "none";
+        resumeBtn.style.display = "block";
+        resumeBtn.disabled = false;
+    }
+});
+
+resumeBtn.addEventListener("click", () => {
+    if (uploadState.isPaused) {
+        uploadState.isPaused = false;
+        pauseBtn.style.display = "block";
+        resumeBtn.style.display = "none";
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Uploading...";
+        
+        // Find the next file that needs uploading (skip completed and removed ones)
+        let nextIndex = uploadState.currentFileIndex;
+        for (let i = uploadState.currentFileIndex; i < selectedFiles.length; i++) {
+            if (removedFileIndices.has(i)) continue; // Skip removed files
+            
+            const relPath = selectedFiles[i].webkitRelativePath || selectedFiles[i].name;
+            if (!uploadState.uploadedFiles.has(relPath)) {
+                nextIndex = i;
+                break;
+            }
+            // If we've checked all files and they're all uploaded, we're done
+            if (i === selectedFiles.length - 1) {
+                uploadFile(selectedFiles.length); // This will trigger completion
+                return;
+            }
+        }
+        
+        uploadState.currentFileIndex = nextIndex;
+        uploadFile(nextIndex);
+    }
+});
+</script>
+</body>
+</html>
